@@ -13,6 +13,8 @@
     let clickHistory: { x: number; y: number; time: number }[] = [];
     let recordingStartTimestamp = 0;
     let activeZoom: { x: number; y: number; scale: number } | null = null;
+    let isTauri =
+        typeof window !== "undefined" && !!(window as any).__TAURI_INTERNALS__;
 
     let timerId: any;
     let videoElement: HTMLVideoElement;
@@ -37,7 +39,9 @@
         if (!$sourceOptions.mouseZoom) {
             // Optional: notify Rust to NOT track if we want to be even more efficient
         }
-        await invoke("start_recording");
+        if (isTauri) {
+            await invoke("start_recording");
+        }
 
         // 1. Start Camera if enabled
         if ($sourceOptions.camera !== "None") {
@@ -264,7 +268,9 @@
     }
 
     function stopRecording() {
-        invoke("stop_recording");
+        if (isTauri) {
+            invoke("stop_recording");
+        }
         if (mediaRecorder && mediaRecorder.state !== "inactive") {
             mediaRecorder.stop();
         } else {
@@ -295,21 +301,27 @@
         }
     }
 
+    let unlistenFn: (() => void) | null = null;
     onMount(async () => {
-        const unlisten = await listen("mouse-click", (event: any) => {
-            if ($appState === "recording") {
-                const click = event.payload;
-                // Assuming click is in screen coordinates, we store it relative to start
-                clickHistory.push({
-                    x: click.x,
-                    y: click.y,
-                    time: Date.now() - recordingStartTimestamp,
+        if (isTauri) {
+            try {
+                unlistenFn = await listen("mouse-click", (event: any) => {
+                    if ($appState === "recording") {
+                        const click = event.payload;
+                        clickHistory.push({
+                            x: click.x,
+                            y: click.y,
+                            time: Date.now() - recordingStartTimestamp,
+                        });
+                    }
                 });
+            } catch (err) {
+                console.error("Failed to setup mouse tracking:", err);
             }
-        });
+        }
 
         return () => {
-            unlisten();
+            if (unlistenFn) unlistenFn();
         };
     });
 
