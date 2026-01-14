@@ -1,7 +1,7 @@
 mod media_bridge;
 
-use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, EmitArgs, State, Manager, Emitter};
+use std::sync::Mutex;
+use tauri::{State, Manager, Emitter};
 use serde::Serialize;
 use rdev::{listen, Event, EventType};
 
@@ -72,22 +72,26 @@ pub fn run() {
             
             // Spawn a thread for global mouse event listening
             thread::spawn(move || {
+                let mut last_x = 0.0;
+                let mut last_y = 0.0;
                 let callback = move |event: Event| {
                     match event.event_type {
+                        EventType::MouseMove { x, y } => {
+                            last_x = x;
+                            last_y = y;
+                        }
                         EventType::ButtonPress(rdev::Button::Left) => {
                             // Only emit if we are actually recording
                             let state = handle.state::<Engine>();
                             if *state.is_recording.lock().unwrap() {
-                                if let (Some(x), Some(y)) = (Some(event.position.x), Some(event.position.y)) {
-                                    let _ = handle.emit("mouse-click", ClickEvent {
-                                        x,
-                                        y,
-                                        timestamp: std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap()
-                                            .as_millis() as u64,
-                                    });
-                                }
+                                let _ = handle.emit("mouse-click", ClickEvent {
+                                    x: last_x,
+                                    y: last_y,
+                                    timestamp: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_millis() as u64,
+                                });
                             }
                         }
                         _ => {}

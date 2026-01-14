@@ -68,7 +68,3 @@ This project is **open-source** and built for the community! We love contributio
 5.  **Open a Pull Request**.
 
 We welcome everyone from beginners to experienced Rust/Svelte developers to jump in and help make Screen Snap the best screen recording tool available!
-
----
-
-*Made with ❤️ by the Screen Snap team.*
