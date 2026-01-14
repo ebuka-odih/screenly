@@ -4,7 +4,6 @@
 
 ![Features](https://img.shields.io/badge/features-Native_Performance-blueviolet)
 ![Tech](https://img.shields.io/badge/tech-Svelte--Tauri--Rust-orange)
-![License](https://img.shields.io/badge/license-MIT-green)
 
 ---
 
@@ -69,12 +68,6 @@ This project is **open-source** and built for the community! We love contributio
 5.  **Open a Pull Request**.
 
 We welcome everyone from beginners to experienced Rust/Svelte developers to jump in and help make Screen Snap the best screen recording tool available!
-
----
-
-## 📜 License
-
-Distributed under the MIT License. See `LICENSE` for more information.
 
 ---
 
