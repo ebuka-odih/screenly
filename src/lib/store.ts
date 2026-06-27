@@ -7,6 +7,8 @@ export const appState = writable<AppState>('idle');
 export interface SourceOptions {
     screen: string;
     camera: string;
+    cameraLabel: string;
+    cameraType: 'none' | 'built-in' | 'continuity' | 'external' | 'unknown';
     mouseZoom: boolean;
     audio: {
         microphone: boolean;
@@ -16,7 +18,9 @@ export interface SourceOptions {
 
 export const sourceOptions = writable<SourceOptions>({
     screen: 'Entire Screen',
-    camera: 'None',
+    camera: 'default-user-camera',
+    cameraLabel: 'Mac Front Camera',
+    cameraType: 'built-in',
     mouseZoom: false,
     audio: {
         microphone: true,
@@ -38,9 +42,17 @@ export interface ScreenSource {
     display_id: number;
 }
 
-export const availableCameras = writable<MediaDeviceInfo[]>([]);
+export interface CameraOption {
+    deviceId: string;
+    groupId?: string;
+    label: string;
+    kind: 'videoinput';
+    cameraType: SourceOptions['cameraType'];
+}
+
+export const availableCameras = writable<CameraOption[]>([]);
 export const availableMics = writable<MediaDeviceInfo[]>([]);
 export const availableScreens = writable<ScreenSource[]>([]);
 
 export const recordedVideoUrl = writable<string | null>(null);
-
+export const recordedVideoMimeType = writable<string>('video/webm');

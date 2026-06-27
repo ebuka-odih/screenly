@@ -11,7 +11,7 @@
         <div class="divider"></div>
         <div class="status-group">
             <span class="status-label">Camera:</span>
-            <span class="status-value">{$sourceOptions.camera}</span>
+            <span class="status-value">{$sourceOptions.cameraLabel}</span>
         </div>
         <div class="divider"></div>
         <div class="status-group">

@@ -7,8 +7,11 @@
         recordingTime,
         sourceOptions,
         recordedVideoUrl,
+        recordedVideoMimeType,
     } from "$lib/store";
     import ExportPanel from "./ExportPanel.svelte";
+
+    const RECORDING_FRAME_RATE = 30;
 
     let clickHistory: { x: number; y: number; time: number }[] = [];
     let recordingStartTimestamp = 0;
@@ -29,35 +32,230 @@
     let mediaRecorder: MediaRecorder | null = null;
     let recordedChunks: Blob[] = [];
     let audioContext: AudioContext | null = null;
+    let captureSessionActive = false;
+    let isStoppingRecording = false;
+    let recordingError = "";
+
+    function getSupportedMimeType() {
+        const supportedTypes = [
+            'video/mp4; codecs="avc1.42E01E, mp4a.40.2"',
+            "video/webm; codecs=vp9,opus",
+            "video/webm; codecs=vp8,opus",
+            "video/webm",
+        ];
+
+        return (
+            supportedTypes.find((type) => MediaRecorder.isTypeSupported(type)) ||
+            ""
+        );
+    }
+
+    function getSelectedCameraConstraintCandidates(): MediaStreamConstraints[] {
+        const isIphoneCamera = $sourceOptions.cameraType === "continuity";
+        const qualityConstraints = {
+            width: { ideal: isIphoneCamera ? 1920 : 1280 },
+            height: { ideal: isIphoneCamera ? 1080 : 720 },
+            frameRate: {
+                ideal: RECORDING_FRAME_RATE,
+                max: RECORDING_FRAME_RATE,
+            },
+        };
+
+        if ($sourceOptions.camera === "default-user-camera") {
+            return [
+                {
+                    video: true,
+                    audio: false,
+                },
+                {
+                    video: {
+                        ...qualityConstraints,
+                        facingMode: { ideal: "user" },
+                    },
+                    audio: false,
+                },
+            ];
+        }
+
+        return [
+            {
+                video: {
+                    ...qualityConstraints,
+                    deviceId: { exact: $sourceOptions.camera },
+                },
+                audio: false,
+            },
+            {
+                video: {
+                    ...qualityConstraints,
+                    deviceId: { ideal: $sourceOptions.camera },
+                },
+                audio: false,
+            },
+            {
+                video: true,
+                audio: false,
+            },
+        ];
+    }
+
+    function describeMediaError(err: unknown) {
+        if (err instanceof DOMException) {
+            if (err.name === "NotAllowedError") {
+                return "Camera permission is blocked. Allow camera access for Screenly, then try recording again.";
+            }
+            if (err.name === "NotFoundError") {
+                return "No camera was found by macOS/WebKit. Check that the Mac camera is available and not in use by another app.";
+            }
+            if (
+                err.name === "OverconstrainedError" ||
+                err.name === "ConstraintNotSatisfiedError"
+            ) {
+                return "The selected camera rejected the requested settings. Trying the default camera failed too.";
+            }
+            if (err.name === "NotReadableError") {
+                return "The camera is busy or unavailable. Close other apps using the camera and try again.";
+            }
+
+            return `${err.name}: ${err.message}`;
+        }
+
+        return err instanceof Error ? err.message : String(err);
+    }
+
+    async function openSelectedCamera() {
+        const constraints = getSelectedCameraConstraintCandidates();
+        let lastError: unknown = null;
+
+        for (const constraint of constraints) {
+            try {
+                return await navigator.mediaDevices.getUserMedia(constraint);
+            } catch (err) {
+                lastError = err;
+                console.warn("Camera constraint failed:", constraint, err);
+            }
+        }
+
+        throw new Error(describeMediaError(lastError));
+    }
+
+    async function attachStreamToVideo(
+        element: HTMLVideoElement | undefined,
+        mediaStream: MediaStream,
+    ) {
+        if (!element) return;
+
+        element.srcObject = mediaStream;
+        await element.play().catch((err) => {
+            console.warn("Video preview could not autoplay:", err);
+        });
+    }
+
+    function startRecorder(compositeStream: MediaStream) {
+        const mimeType = getSupportedMimeType();
+
+        mediaRecorder = mimeType
+            ? new MediaRecorder(compositeStream, { mimeType })
+            : new MediaRecorder(compositeStream);
+
+        mediaRecorder.ondataavailable = (e) => {
+            if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+        };
+
+        mediaRecorder.onstop = () => {
+            const finalBlob = new Blob(recordedChunks, {
+                type: mediaRecorder?.mimeType || "video/mp4",
+            });
+            const url = URL.createObjectURL(finalBlob);
+            recordedVideoUrl.set(url);
+            recordedVideoMimeType.set(finalBlob.type || "video/webm");
+            recordedChunks = [];
+            stopAllStreams();
+            captureSessionActive = false;
+            isStoppingRecording = false;
+            appState.set("export");
+        };
+
+        mediaRecorder.start(1000);
+        recordingStartTimestamp = Date.now();
+        startRecordingTimer();
+
+        if (isTauri) {
+            invoke("start_recording").catch((err) =>
+                console.warn("Failed to start native recording state:", err),
+            );
+        }
+    }
+
+    async function startCameraOnlyCapture(message = "") {
+        if (!stream) {
+            throw new Error(
+                recordingError ||
+                    "Camera could not be opened. Check camera permission and try again.",
+            );
+        }
+
+        const cameraTrack = stream.getVideoTracks()[0];
+        const settings = cameraTrack.getSettings();
+        const width = settings.width || videoElement?.videoWidth || 1280;
+        const height = settings.height || videoElement?.videoHeight || 720;
+
+        canvasElement = document.createElement("canvas");
+        canvasElement.width = width;
+        canvasElement.height = height;
+        canvasCtx = canvasElement.getContext("2d");
+
+        const compositeStream =
+            canvasElement.captureStream(RECORDING_FRAME_RATE);
+
+        if (audioStream && audioStream.getAudioTracks().length > 0) {
+            audioStream
+                .getAudioTracks()
+                .forEach((track) => compositeStream.addTrack(track));
+        }
+
+        const draw = () => {
+            if (!canvasCtx) return;
+
+            canvasCtx.fillStyle = "#000";
+            canvasCtx.fillRect(0, 0, width, height);
+
+            if (videoElement && videoElement.readyState >= 2) {
+                canvasCtx.save();
+                canvasCtx.translate(width, 0);
+                canvasCtx.scale(-1, 1);
+                canvasCtx.drawImage(videoElement, 0, 0, width, height);
+                canvasCtx.restore();
+            }
+
+            animationId = requestAnimationFrame(draw);
+        };
+        draw();
+
+        if (message) recordingError = message;
+        startRecorder(compositeStream);
+    }
 
     async function startCapture() {
         await tick();
         recordedChunks = [];
         clickHistory = [];
-        recordingStartTimestamp = Date.now();
+        isStoppingRecording = false;
+        recordingError = "";
+        recordedVideoUrl.set(null);
 
         if (!$sourceOptions.mouseZoom) {
             // Optional: notify Rust to NOT track if we want to be even more efficient
-        }
-        if (isTauri) {
-            await invoke("start_recording");
         }
 
         // 1. Start Camera if enabled
         if ($sourceOptions.camera !== "None") {
             try {
-                const constraints = {
-                    video: { deviceId: { exact: $sourceOptions.camera } },
-                    audio: false,
-                };
-                stream = await navigator.mediaDevices.getUserMedia(constraints);
-                if (videoElement) videoElement.srcObject = stream;
+                stream = await openSelectedCamera();
+                await attachStreamToVideo(videoElement, stream);
             } catch (err) {
                 console.error("Error accessing camera:", err);
-                stream = await navigator.mediaDevices.getUserMedia({
-                    video: true,
-                });
-                if (videoElement) videoElement.srcObject = stream;
+                recordingError = describeMediaError(err);
             }
         }
 
@@ -72,13 +270,39 @@
             }
         }
 
+        if ($sourceOptions.screen === "camera-only") {
+            try {
+                await startCameraOnlyCapture();
+            } catch (err) {
+                console.error("Error starting camera-only recording:", err);
+                recordingError =
+                    err instanceof Error
+                        ? err.message
+                        : "Camera recording could not start.";
+                captureSessionActive = false;
+                isStoppingRecording = false;
+                stopAllStreams();
+                clearInterval(timerId);
+                appState.set("idle");
+            }
+            return;
+        }
+
         // 3. Start Screen Capture
         try {
+            const displayVideoConstraints = {
+                cursor: "always",
+                frameRate: {
+                    ideal: RECORDING_FRAME_RATE,
+                    max: RECORDING_FRAME_RATE,
+                },
+            } as MediaTrackConstraints & { cursor: string };
+
             screenStream = await navigator.mediaDevices.getDisplayMedia({
-                video: { cursor: "always" },
+                video: displayVideoConstraints,
                 audio: $sourceOptions.audio.system,
             });
-            if (screenVideoElement) screenVideoElement.srcObject = screenStream;
+            await attachStreamToVideo(screenVideoElement, screenStream);
 
             // Setup Canvas Compositor
             const track = screenStream.getVideoTracks()[0];
@@ -91,7 +315,8 @@
             canvasElement.height = height;
             canvasCtx = canvasElement.getContext("2d");
 
-            const compositeStream = canvasElement.captureStream(60); // 60 FPS
+            const compositeStream =
+                canvasElement.captureStream(RECORDING_FRAME_RATE);
 
             // --- Audio Mixing Logic ---
             audioContext = new AudioContext();
@@ -216,36 +441,44 @@
             };
             draw();
 
-            // Initialize MediaRecorder
-            let mimeType = 'video/mp4; codecs="avc1.42E01E, mp4a.40.2"';
-            if (!MediaRecorder.isTypeSupported(mimeType)) {
-                mimeType = "video/webm; codecs=vp8";
-                if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = "";
-            }
-
-            mediaRecorder = new MediaRecorder(compositeStream, { mimeType });
-
-            mediaRecorder.ondataavailable = (e) => {
-                if (e.data && e.data.size > 0) recordedChunks.push(e.data);
-            };
-
-            mediaRecorder.onstop = () => {
-                const finalBlob = new Blob(recordedChunks, {
-                    type: mediaRecorder?.mimeType || "video/mp4",
-                });
-                const url = URL.createObjectURL(finalBlob);
-                recordedVideoUrl.set(url);
-                recordedChunks = [];
-                stopAllStreams();
-            };
-
-            mediaRecorder.start(1000);
+            startRecorder(compositeStream);
 
             track.onended = () => stopRecording();
         } catch (err) {
             console.error("Error accessing screen:", err);
+            if (stream) {
+                try {
+                    await startCameraOnlyCapture(
+                        "Screen capture failed. Recording camera only.",
+                    );
+                    return;
+                } catch (cameraOnlyErr) {
+                    console.error(
+                        "Camera-only fallback failed:",
+                        cameraOnlyErr,
+                    );
+                }
+            }
+            recordingError = "Screen capture was cancelled or unavailable.";
+            captureSessionActive = false;
+            isStoppingRecording = false;
+            if (isTauri) {
+                invoke("stop_recording").catch((invokeErr) =>
+                    console.warn("Failed to stop native recording:", invokeErr),
+                );
+            }
+            stopAllStreams();
+            clearInterval(timerId);
             appState.set("idle");
         }
+    }
+
+    function startRecordingTimer() {
+        clearInterval(timerId);
+        recordingTime.set(0);
+        timerId = setInterval(() => {
+            recordingTime.update((n) => n + 1);
+        }, 1000);
     }
 
     function stopAllStreams() {
@@ -265,18 +498,27 @@
         if (audioContext && audioContext.state !== "closed") {
             audioContext.close();
         }
+        audioContext = null;
     }
 
     function stopRecording() {
+        if (isStoppingRecording) return;
+
+        isStoppingRecording = true;
         if (isTauri) {
-            invoke("stop_recording");
+            invoke("stop_recording").catch((err) =>
+                console.warn("Failed to stop native recording:", err),
+            );
         }
         if (mediaRecorder && mediaRecorder.state !== "inactive") {
+            mediaRecorder.requestData();
             mediaRecorder.stop();
         } else {
             stopAllStreams();
+            captureSessionActive = false;
+            isStoppingRecording = false;
+            appState.set("idle");
         }
-        appState.set("export");
         clearInterval(timerId);
     }
 
@@ -302,10 +544,11 @@
     }
 
     let unlistenFn: (() => void) | null = null;
-    onMount(async () => {
+    onMount(() => {
+        let destroyed = false;
+
         if (isTauri) {
-            try {
-                unlistenFn = await listen("mouse-click", (event: any) => {
+            listen("mouse-click", (event: any) => {
                     if ($appState === "recording") {
                         const click = event.payload;
                         clickHistory.push({
@@ -314,25 +557,33 @@
                             time: Date.now() - recordingStartTimestamp,
                         });
                     }
+                })
+                .then((unlisten) => {
+                    if (destroyed) {
+                        unlisten();
+                        return;
+                    }
+                    unlistenFn = unlisten;
+                })
+                .catch((err) => {
+                    console.error("Failed to setup mouse tracking:", err);
                 });
-            } catch (err) {
-                console.error("Failed to setup mouse tracking:", err);
-            }
         }
 
         return () => {
+            destroyed = true;
             if (unlistenFn) unlistenFn();
         };
     });
 
-    $: if ($appState === "recording") {
+    $: if ($appState === "recording" && !captureSessionActive) {
+        captureSessionActive = true;
         recordingTime.set(0);
         startCapture();
-        timerId = setInterval(() => {
-            recordingTime.update((n) => n + 1);
-        }, 1000);
     } else if ($appState === "idle") {
         stopAllStreams();
+        captureSessionActive = false;
+        isStoppingRecording = false;
         clearInterval(timerId);
     } else {
         clearInterval(timerId);
@@ -370,6 +621,24 @@
     function handleMouseUp() {
         isDragging = false;
     }
+
+    function handleOverlayKeydown(e: KeyboardEvent) {
+        const step = e.shiftKey ? 30 : 10;
+
+        if (e.key === "ArrowUp") {
+            camPos = { ...camPos, y: camPos.y - step };
+        } else if (e.key === "ArrowDown") {
+            camPos = { ...camPos, y: camPos.y + step };
+        } else if (e.key === "ArrowLeft") {
+            camPos = { ...camPos, x: camPos.x - step };
+        } else if (e.key === "ArrowRight") {
+            camPos = { ...camPos, x: camPos.x + step };
+        } else {
+            return;
+        }
+
+        e.preventDefault();
+    }
 </script>
 
 <svelte:window on:mousemove={handleMouseMove} on:mouseup={handleMouseUp} />
@@ -402,6 +671,7 @@
                     bind:this={screenVideoElement}
                     autoplay
                     playsinline
+                    muted
                     class="screen-video"
                 >
                     <track kind="captions" />
@@ -412,6 +682,10 @@
                     class="face-cam-overlay"
                     style="transform: translate({camPos.x}px, {camPos.y}px)"
                     on:mousedown={handleMouseDown}
+                    on:keydown={handleOverlayKeydown}
+                    role="button"
+                    tabindex="0"
+                    aria-label="Camera overlay"
                 >
                     <div class="cam-indicator">LIVE</div>
                     <video
@@ -425,7 +699,11 @@
                     </video>
                     {#if !stream}
                         <div class="cam-lens"></div>
-                        <span class="cam-label">Camera Off</span>
+                        <span class="cam-label"
+                            >{$sourceOptions.camera === "None"
+                                ? "Camera Off"
+                                : "Camera Unavailable"}</span
+                        >
                     {/if}
                 </div>
             </div>
@@ -435,12 +713,14 @@
                     <span class="rec-dot"></span>
                     <span class="timer-text">{formatTime($recordingTime)}</span>
                 </div>
-
                 <button class="stop-trigger" on:click={stopRecording}>
                     <div class="stop-icon"></div>
                     <span>End Session</span>
                 </button>
             </div>
+            {#if recordingError}
+                <div class="recording-warning glass">{recordingError}</div>
+            {/if}
         </div>
     {:else if $appState === "export"}
         <div class="view-container export-view">
@@ -733,6 +1013,20 @@
         color: #fff;
     }
 
+    .recording-warning {
+        position: absolute;
+        left: 50%;
+        bottom: 92px;
+        transform: translateX(-50%);
+        border: 1px solid rgba(255, 184, 77, 0.2);
+        border-radius: 8px;
+        color: #ffcc80;
+        font-size: 0.8rem;
+        padding: 10px 14px;
+        max-width: min(520px, calc(100vw - 48px));
+        text-align: center;
+    }
+
     .stop-trigger {
         background: #ff3b30;
         color: white;
@@ -815,25 +1109,6 @@
         to {
             transform: rotate(360deg);
         }
-    }
-
-    .timeline {
-        height: 4px;
-        background: rgba(255, 255, 255, 0.1);
-        border-radius: 2px;
-        margin-bottom: 10px;
-    }
-
-    .progress {
-        height: 100%;
-        background: #fff;
-        border-radius: 2px;
-    }
-
-    .timestamp {
-        font-size: 0.75rem;
-        color: rgba(255, 255, 255, 0.5);
-        font-family: monospace;
     }
 
     .export-title {

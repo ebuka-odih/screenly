@@ -6,43 +6,122 @@
         sourceOptions,
         availableCameras,
         availableScreens,
+        type CameraOption,
+        type SourceOptions,
     } from "$lib/store";
 
     let selectedScreen = "Entire Screen";
-    let selectedCamera = "None";
+    let selectedCamera = "default-user-camera";
     let micEnabled = true;
     let systemAudioEnabled = false;
     let mouseZoomEnabled = false;
     let isCollapsed = false;
 
     let isBrowser = false;
+    let cameraPermission = "unknown";
+    let cameraRefreshMessage = "";
+    let selectedCameraOption: CameraOption | null = null;
+    const defaultMacCamera: CameraOption = {
+        deviceId: "default-user-camera",
+        label: "Mac Front Camera",
+        kind: "videoinput",
+        cameraType: "built-in",
+    };
 
-    async function refreshDevices() {
+    function classifyCamera(label: string): SourceOptions["cameraType"] {
+        const normalized = label.toLowerCase();
+
+        if (
+            normalized.includes("iphone") ||
+            normalized.includes("continuity")
+        ) {
+            return "continuity";
+        }
+
+        if (
+            normalized.includes("facetime") ||
+            normalized.includes("built-in") ||
+            normalized.includes("front")
+        ) {
+            return "built-in";
+        }
+
+        if (label) return "external";
+
+        return "unknown";
+    }
+
+    function formatCameraLabel(device: MediaDeviceInfo, index: number) {
+        const label = device.label || `Camera ${index + 1}`;
+        const cameraType = classifyCamera(label);
+
+        if (cameraType === "built-in") return `Laptop Front Camera - ${label}`;
+        if (cameraType === "continuity") {
+            return `iPhone Camera - ${label}`;
+        }
+        if (cameraType === "external") return `External Camera - ${label}`;
+
+        return label;
+    }
+
+    async function refreshDevices(requestCameraPermission = false) {
         // Detect environment
         isBrowser =
             typeof window !== "undefined" &&
             !(window as any).__TAURI_INTERNALS__;
+        cameraRefreshMessage = "Checking cameras...";
 
-        // Request permission to unblock labels
-        try {
-            const stream = await navigator.mediaDevices.getUserMedia({
-                video: true,
-            });
-            stream.getTracks().forEach((t) => t.stop());
-        } catch (e) {
-            console.warn("Camera permission prompt failed or denied:", e);
+        if (requestCameraPermission) {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: true,
+                });
+                stream.getTracks().forEach((t) => t.stop());
+                cameraPermission = "granted";
+            } catch (e) {
+                cameraPermission = "denied";
+                console.warn("Camera permission prompt failed or denied:", e);
+            }
+        }
+
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const videoDevices = devices.filter((d) => d.kind === "videoinput");
+        const mappedVideoDevices: CameraOption[] = [
+            defaultMacCamera,
+            ...videoDevices.map((device, index) => ({
+                deviceId: device.deviceId,
+                groupId: device.groupId,
+                label: formatCameraLabel(device, index),
+                kind: "videoinput" as const,
+                cameraType: classifyCamera(device.label),
+            })),
+        ];
+
+        availableCameras.set(mappedVideoDevices);
+
+        if (
+            selectedCamera !== "None" &&
+            !mappedVideoDevices.some((camera) => camera.deviceId === selectedCamera)
+        ) {
+            selectedCamera = "None";
+        }
+
+        if (mappedVideoDevices.length === 0) {
+            cameraRefreshMessage =
+                cameraPermission === "denied"
+                    ? "Camera permission is blocked."
+                    : "No cameras found.";
+        } else {
+            const hasIphone = mappedVideoDevices.some(
+                (camera) => camera.cameraType === "continuity",
+            );
+            cameraRefreshMessage = hasIphone
+                ? "Laptop and iPhone cameras available."
+                : "Camera list ready.";
         }
 
         if (!isBrowser) {
             try {
-                const cams = await invoke("list_cameras");
-                const mappedCams = (cams as any[]).map((c) => ({
-                    deviceId: c.id,
-                    label: c.name,
-                    kind: "videoinput" as const,
-                }));
-                availableCameras.set(mappedCams as MediaDeviceInfo[]);
-
                 const screens = await invoke("list_screens");
                 const mappedScreens = (screens as any[]).map((s) => ({
                     id: s.id,
@@ -64,11 +143,6 @@
         }
 
         // Browser fallback (or if native bridge failed)
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        const videoDevices = devices.filter((d) => d.kind === "videoinput");
-        availableCameras.set(videoDevices);
-
-        // In browser fallback, add a placeholder so the dropdown isn't empty
         availableScreens.set([
             {
                 id: "browser-screen",
@@ -84,7 +158,7 @@
     onMount(() => {
         refreshDevices();
         // Listen for device changes (Continuity Camera can be dynamic)
-        navigator.mediaDevices.ondevicechange = refreshDevices;
+        navigator.mediaDevices.ondevicechange = () => refreshDevices();
     });
 
     function startRecording() {
@@ -95,9 +169,18 @@
         isCollapsed = !isCollapsed;
     }
 
+    $: selectedCameraOption =
+        selectedCamera === "None"
+            ? null
+            : $availableCameras.find(
+                  (camera) => camera.deviceId === selectedCamera,
+              ) || null;
+
     $: sourceOptions.set({
         screen: selectedScreen,
         camera: selectedCamera,
+        cameraLabel: selectedCameraOption?.label || "None",
+        cameraType: selectedCameraOption?.cameraType || "none",
         mouseZoom: mouseZoomEnabled,
         audio: {
             microphone: micEnabled,
@@ -139,20 +222,29 @@
             <section class="section">
                 <h2 class="section-title">Video Source</h2>
                 <div class="input-group">
-                    <label>Select Screen</label>
-                    <select bind:value={selectedScreen} class="select">
+                    <label for="screen-source">Select Screen</label>
+                    <select
+                        id="screen-source"
+                        bind:value={selectedScreen}
+                        class="select"
+                    >
                         {#each $availableScreens as s}
                             <option value={s.id}>{s.name}</option>
                         {/each}
+                        <option value="camera-only">Camera Only</option>
                         <option value="window">Select Window...</option>
                         <option value="region">Select Region...</option>
                     </select>
                 </div>
 
                 <div class="input-group">
-                    <label>Face Camera</label>
+                    <label for="camera-source">Face Camera</label>
                     <div class="select-wrapper">
-                        <select bind:value={selectedCamera} class="select">
+                        <select
+                            id="camera-source"
+                            bind:value={selectedCamera}
+                            class="select"
+                        >
                             <option value="None">None (Camera Disabled)</option>
                             {#each $availableCameras as cam}
                                 <option value={cam.deviceId}
@@ -162,10 +254,13 @@
                         </select>
                         <button
                             class="refresh-mini"
-                            on:click={refreshDevices}
+                            on:click={() => refreshDevices(true)}
                             title="Refresh Cameras">↻</button
                         >
                     </div>
+                    {#if cameraRefreshMessage}
+                        <span class="helper-text">{cameraRefreshMessage}</span>
+                    {/if}
                 </div>
             </section>
 
@@ -404,6 +499,12 @@
     .refresh-mini:hover {
         background: rgba(255, 255, 255, 0.1);
         color: #fff;
+    }
+
+    .helper-text {
+        color: rgba(255, 255, 255, 0.35);
+        font-size: 0.7rem;
+        line-height: 1.4;
     }
 
     .checkbox-group {

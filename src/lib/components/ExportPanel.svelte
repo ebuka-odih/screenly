@@ -1,5 +1,10 @@
 <script lang="ts">
-    import { appState, recordedVideoUrl, sourceOptions } from "$lib/store";
+    import {
+        appState,
+        recordedVideoMimeType,
+        recordedVideoUrl,
+        sourceOptions,
+    } from "$lib/store";
     import { get } from "svelte/store";
 
     let resolution = "1080p";
@@ -7,10 +12,13 @@
 
     function saveFile() {
         const url = get(recordedVideoUrl);
+        const mimeType = get(recordedVideoMimeType);
+        const extension = mimeType.includes("mp4") ? "mp4" : "webm";
+
         if (url) {
             const a = document.createElement("a");
             a.href = url;
-            a.download = `recording-${new Date().getTime()}.webm`;
+            a.download = `recording-${new Date().getTime()}.${extension}`;
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
